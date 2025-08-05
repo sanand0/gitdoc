@@ -2,7 +2,7 @@ import { reaction } from "mobx";
 import * as vscode from "vscode";
 import { registerCommands } from "./commands";
 import config from "./config";
-import { getGitApi, GitAPI, RefType } from "./git";
+import { getGitApi, GitAPI, RefType, Repository } from "./git";
 import { store } from "./store";
 import { commit, watchForChanges } from "./watcher";
 import { updateContext } from "./utils";
@@ -27,18 +27,20 @@ export async function activate(context: vscode.ExtensionContext) {
 
   reaction(
     () => [store.enabled],
-    () => checkEnabled(git)
+    () => checkEnabled(git),
   );
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration("gitdoc.enabled") ||
+      if (
+        e.affectsConfiguration("gitdoc.enabled") ||
         e.affectsConfiguration("gitdoc.excludeBranches") ||
         e.affectsConfiguration("gitdoc.autoCommitDelay") ||
-        e.affectsConfiguration("gitdoc.filePattern")) {
+        e.affectsConfiguration("gitdoc.filePattern")
+      ) {
         checkEnabled(git);
       }
-    })
+    }),
   );
 }
 
@@ -49,29 +51,25 @@ async function checkEnabled(git: GitAPI) {
     watcher = null;
   }
 
-  let branchName = git.repositories[0]?.state?.HEAD?.name;
-
-  if (!branchName) {
-    const refs = await git.repositories[0]?.getRefs();
-    branchName = refs?.find((ref) => ref.type === RefType.Head)?.name;
+  const repos: Repository[] = [];
+  for (const repo of git.repositories) {
+    let branch = repo.state.HEAD?.name;
+    if (!branch) {
+      const refs = await repo.getRefs();
+      branch = refs.find((r) => r.type === RefType.Head)?.name;
+    }
+    if (branch && !config.excludeBranches.includes(branch)) repos.push(repo);
   }
 
-  const enabled =
-    git.repositories.length > 0 &&
-    store.enabled && !!branchName && !config.excludeBranches.includes(branchName);
-
+  const enabled = repos.length > 0 && store.enabled;
   updateContext(enabled, false);
 
-  if (enabled) {
-    watcher = watchForChanges(git);
-  }
+  if (enabled) watcher = watchForChanges(repos);
 }
 
 export async function deactivate() {
-  if (store.enabled && config.commitOnClose) {
-    const git = await getGitApi();
-    if (git && git.repositories.length > 0) {
-      return commit(git.repositories[0]);
-    }
-  }
+  if (!store.enabled || !config.commitOnClose) return;
+  const git = await getGitApi();
+  if (!git) return;
+  for (const repo of git.repositories) await commit(repo);
 }
