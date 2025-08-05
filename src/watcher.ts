@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import config from "./config";
-import { ForcePushMode, GitAPI, Repository, RefType } from "./git";
+import { ForcePushMode, Repository, RefType } from "./git";
 import { DateTime } from "luxon";
 import { store } from "./store";
 import { reaction } from "mobx";
@@ -8,10 +8,7 @@ import * as minimatch from "minimatch";
 
 const REMOTE_NAME = "origin";
 
-async function pushRepository(
-  repository: Repository,
-  forcePush: boolean = false
-) {
+async function pushRepository(repository: Repository, forcePush: boolean = false) {
   if (!(await hasRemotes(repository))) return;
 
   store.isPushing = true;
@@ -26,10 +23,7 @@ async function pushRepository(
     if (forcePush) {
       pushArgs.push(ForcePushMode.Force);
     } else if (config.pushMode !== "push") {
-      const pushMode =
-        config.pushMode === "forcePush"
-          ? ForcePushMode.Force
-          : ForcePushMode.ForceWithLease;
+      const pushMode = config.pushMode === "forcePush" ? ForcePushMode.Force : ForcePushMode.ForceWithLease;
 
       pushArgs.push(pushMode);
     }
@@ -40,12 +34,7 @@ async function pushRepository(
   } catch {
     store.isPushing = false;
 
-    if (
-      await vscode.window.showWarningMessage(
-        "Remote repository contains conflicting changes.",
-        "Force Push"
-      )
-    ) {
+    if (await vscode.window.showWarningMessage("Remote repository contains conflicting changes.", "Force Push")) {
       await pushRepository(repository, true);
     }
   }
@@ -79,7 +68,8 @@ async function generateCommitMessage(repository: Repository, changedUris: vscode
       return `## ${filePath}
 ---
 ${fileDiff}`;
-    }));
+    }),
+  );
 
   const model = await vscode.lm.selectChatModels({ family: config.aiModel });
   if (!model || model.length === 0) return null;
@@ -98,19 +88,25 @@ ${config.aiUseEmojis ? "* Prepend an emoji to the message that expresses the nat
 
 ${diffs.join("\n\n")}
 
-${config.aiCustomInstructions ? `# Additional Instructions (Important!)
+${
+  config.aiCustomInstructions
+    ? `# Additional Instructions (Important!)
   
 ${config.aiCustomInstructions}
-` : ""}
+`
+    : ""
+}
 # Commit message
 
 `;
 
-  const response = await model[0].sendRequest([{
-    role: vscode.LanguageModelChatMessageRole.User,
-    name: "User",
-    content: prompt
-  }]);
+  const response = await model[0].sendRequest([
+    {
+      role: vscode.LanguageModelChatMessageRole.User,
+      name: "User",
+      content: prompt,
+    },
+  ]);
 
   let summary = "";
   for await (const part of response.text) {
@@ -121,9 +117,14 @@ ${config.aiCustomInstructions}
 }
 
 export async function commit(repository: Repository, message?: string) {
-  // This function shouldn't ever be called when GitDoc
-  // is disabled, but we're checking it just in case.
   if (store.enabled === false) return;
+
+  let branch = repository.state.HEAD?.name;
+  if (!branch) {
+    const refs = await repository.getRefs();
+    branch = refs.find((r) => r.type === RefType.Head)?.name;
+  }
+  if (!branch || config.excludeBranches.includes(branch)) return;
 
   const changes = [
     ...repository.state.workingTreeChanges,
@@ -133,30 +134,22 @@ export async function commit(repository: Repository, message?: string) {
 
   if (changes.length === 0) return;
 
-  const changedUris = changes
-    .filter((change) => matches(change.uri))
-    .map((change) => change.uri);
+  const changedUris = changes.filter((change) => matches(change.uri)).map((change) => change.uri);
 
   if (changedUris.length === 0) return;
 
   if (config.commitValidationLevel !== "none") {
-    const diagnostics = vscode.languages
-      .getDiagnostics()
-      .filter(([uri, diagnostics]) => {
-        const isChanged = changedUris.find(
-          (changedUri) =>
-            changedUri.toString().localeCompare(uri.toString()) === 0
-        );
+    const diagnostics = vscode.languages.getDiagnostics().filter(([uri, diagnostics]) => {
+      const isChanged = changedUris.find((changedUri) => changedUri.toString().localeCompare(uri.toString()) === 0);
 
-        return isChanged
-          ? diagnostics.some(
+      return isChanged
+        ? diagnostics.some(
             (diagnostic) =>
               diagnostic.severity === vscode.DiagnosticSeverity.Error ||
-              (config.commitValidationLevel === "warning" &&
-                diagnostic.severity === vscode.DiagnosticSeverity.Warning)
+              (config.commitValidationLevel === "warning" && diagnostic.severity === vscode.DiagnosticSeverity.Warning),
           )
-          : false;
-      });
+        : false;
+    });
 
     if (diagnostics.length > 0) {
       return;
@@ -219,7 +212,7 @@ function debouncedCommit(repository: Repository) {
   if (!commitMap.has(repository)) {
     commitMap.set(
       repository,
-      debounce(() => commit(repository), config.autoCommitDelay)
+      debounce(() => commit(repository), config.autoCommitDelay),
     );
   }
 
@@ -229,9 +222,7 @@ function debouncedCommit(repository: Repository) {
 let statusBarItem: vscode.StatusBarItem | null = null;
 export function ensureStatusBarItem() {
   if (!statusBarItem) {
-    statusBarItem = vscode.window.createStatusBarItem(
-      vscode.StatusBarAlignment.Left
-    );
+    statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
 
     statusBarItem.text = "$(mirror)";
     statusBarItem.tooltip = "GitDoc: Auto-commiting files on save";
@@ -243,9 +234,23 @@ export function ensureStatusBarItem() {
 }
 
 let disposables: vscode.Disposable[] = [];
-export function watchForChanges(git: GitAPI): vscode.Disposable {
-  const commitAfterDelay = debouncedCommit(git.repositories[0]);
-  disposables.push(git.repositories[0].state.onDidChange(commitAfterDelay));
+export function watchForChanges(repositories: Repository[]): vscode.Disposable {
+  repositories.forEach((repo) => {
+    const commitAfterDelay = debouncedCommit(repo);
+    disposables.push(repo.state.onDidChange(commitAfterDelay));
+
+    if (config.autoPush === "afterDelay") {
+      const interval = setInterval(() => pushRepository(repo), config.autoPushDelay);
+      disposables.push({ dispose: () => clearInterval(interval) });
+    }
+
+    if (config.autoPull === "afterDelay") {
+      const interval = setInterval(() => pullRepository(repo), config.autoPullDelay);
+      disposables.push({ dispose: () => clearInterval(interval) });
+    }
+
+    if (config.pullOnOpen) pullRepository(repo);
+  });
 
   ensureStatusBarItem();
 
@@ -253,16 +258,13 @@ export function watchForChanges(git: GitAPI): vscode.Disposable {
     vscode.window.onDidChangeActiveTextEditor((editor) => {
       if (editor && matches(editor.document.uri)) {
         statusBarItem?.show();
-      } else {
-        statusBarItem?.hide();
+        return;
       }
-    })
+      statusBarItem?.hide();
+    }),
   );
 
-  if (
-    vscode.window.activeTextEditor &&
-    matches(vscode.window.activeTextEditor.document.uri)
-  ) {
+  if (vscode.window.activeTextEditor && matches(vscode.window.activeTextEditor.document.uri)) {
     statusBarItem?.show();
   } else {
     statusBarItem?.hide();
@@ -275,52 +277,19 @@ export function watchForChanges(git: GitAPI): vscode.Disposable {
     },
   });
 
-  if (config.autoPush === "afterDelay") {
-    const interval = setInterval(async () => {
-      pushRepository(git.repositories[0]);
-    }, config.autoPushDelay);
-
-    disposables.push({
-      dispose: () => {
-        clearInterval(interval);
-      },
-    });
-  }
-
-  if (config.autoPull === "afterDelay") {
-    const interval = setInterval(
-      async () => pullRepository(git.repositories[0]),
-      config.autoPullDelay
-    );
-
-    disposables.push({
-      dispose: () => clearInterval(interval),
-    });
-  }
-
   const reactionDisposable = reaction(
     () => [store.isPushing, store.isPulling],
     () => {
-      const suffix = store.isPushing
-        ? " (Pushing...)"
-        : store.isPulling
-          ? " (Pulling...)"
-          : "";
+      const suffix = store.isPushing ? " (Pushing...)" : store.isPulling ? " (Pulling...)" : "";
       statusBarItem!.text = `$(mirror)${suffix}`;
-    }
+    },
   );
 
-  disposables.push({
-    dispose: reactionDisposable,
-  });
-
-  if (config.pullOnOpen) {
-    pullRepository(git.repositories[0]);
-  }
+  disposables.push({ dispose: reactionDisposable });
 
   return {
     dispose: () => {
-      disposables.forEach((disposable) => disposable.dispose());
+      disposables.forEach((d) => d.dispose());
       disposables = [];
     },
   };
